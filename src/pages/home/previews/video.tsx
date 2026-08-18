@@ -81,9 +81,9 @@ const fetchFileMd5 = async (
     const hash = md5(arrayBuffer)
 
     return hash
-  } catch {
-    console.log("eror when downloading")
-    return "658d05841b9476ccc7420b3f0bb21c3b"
+  } catch (e: any){
+    console.log("error when downloading", e)
+    throw e;
   }
 }
 
