@@ -106,8 +106,11 @@ const fetchFileMd5 = async (
       await sleep(delay, signal)
 
       try {
-        const response = await axios.get(
-          `/danmakuhub/md5?filename=${encodeURIComponent(filename)}`,
+        const response = await axios.post(
+          `/danmakuhub/md5?link=${encodeURIComponent(
+            link,
+          )}&filename=${encodeURIComponent(filename)}`,
+          null,
           { signal },
         )
         if (response.status === 200 && response.data?.hash) {
