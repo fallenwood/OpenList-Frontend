@@ -24,3 +24,17 @@ if (api === "/") {
 if (api.endsWith("/")) {
   api = api.slice(0, -1)
 }
+
+export const getDisableFrontendMd5 = (): boolean => {
+  if (window.OPENLIST_CONFIG?.disable_frontend_md5 !== undefined) {
+    const val = window.OPENLIST_CONFIG.disable_frontend_md5
+    return typeof val === "string"
+      ? val !== "false" && val !== "0"
+      : Boolean(val)
+  }
+  if (import.meta.env.VITE_DISABLE_FRONTEND_MD5 !== undefined) {
+    const val = import.meta.env.VITE_DISABLE_FRONTEND_MD5
+    return val !== "false" && val !== "0"
+  }
+  return true
+}

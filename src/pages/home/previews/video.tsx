@@ -15,7 +15,7 @@ import {
   setShouldKeepState,
 } from "~/store"
 import { Obj, ObjType } from "~/types"
-import { ext, pathDir, pathJoin } from "~/utils"
+import { ext, getDisableFrontendMd5, pathDir, pathJoin } from "~/utils"
 import Artplayer from "artplayer"
 import { type Option } from "artplayer"
 import { type Setting } from "artplayer"
@@ -35,20 +35,43 @@ import { md5 } from "js-md5"
 import "./artplayer.css"
 
 const Red = "red"
+
+const sleep = (ms: number, signal?: AbortSignal): Promise<void> => {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      return reject(new Error("Aborted"))
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort)
+      resolve()
+    }, ms)
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(new Error("Aborted"))
+    }
+    signal?.addEventListener("abort", onAbort, { once: true })
+  })
+}
+
 const fetchFileMd5 = async (
   link: string,
   filename: string,
+  signal?: AbortSignal,
 ): Promise<string> => {
   console.log("link", link)
 
   try {
     const preget = await axios.get(
       `/danmakuhub/md5?filename=${encodeURIComponent(filename)}`,
+      { signal },
     )
-    if (preget.status === 200) {
+    if (preget.status === 200 && preget.data?.hash) {
       return preget.data.hash
     }
-  } catch {
+  } catch (e: any) {
+    if (signal?.aborted || e?.name === "CanceledError" || axios.isCancel(e)) {
+      throw e
+    }
     console.info("preget failed, continue posting...")
   }
 
@@ -58,13 +81,49 @@ const fetchFileMd5 = async (
       `/danmakuhub/md5?link=${encodeURIComponent(
         link,
       )}&filename=${encodeURIComponent(filename)}`,
+      null,
+      { signal },
     )
 
-    if (preflight.status === 200) {
+    if (preflight.status === 200 && preflight.data?.hash) {
       return preflight.data.hash
     }
-  } catch {
-    console.info("preflight failed, continue caluclating...")
+  } catch (e: any) {
+    if (signal?.aborted || e?.name === "CanceledError" || axios.isCancel(e)) {
+      throw e
+    }
+    console.info("preflight failed, continue calculating / polling...")
+  }
+
+  if (getDisableFrontendMd5()) {
+    const maxRetries = 5
+    let delay = 5000
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      console.info(
+        `Polling backend md5 attempt ${attempt}/${maxRetries} in ${delay / 1000}s...`,
+      )
+      await sleep(delay, signal)
+
+      try {
+        const response = await axios.get(
+          `/danmakuhub/md5?filename=${encodeURIComponent(filename)}`,
+          { signal },
+        )
+        if (response.status === 200 && response.data?.hash) {
+          return response.data.hash
+        }
+      } catch (e: any) {
+        if (signal?.aborted || e?.name === "CanceledError" || axios.isCancel(e)) {
+          throw e
+        }
+        console.info(`Polling backend md5 attempt ${attempt} failed`)
+      }
+
+      delay *= 2
+    }
+
+    throw new Error("Failed to obtain MD5 from backend after maximum retries")
   }
 
   try {
@@ -74,6 +133,7 @@ const fetchFileMd5 = async (
         // 16MB
         Range: "bytes=0-16777215",
       },
+      signal,
     }
     const response = await axios.get(link, config)
     const data = response.data as Blob
@@ -81,40 +141,48 @@ const fetchFileMd5 = async (
     const hash = md5(arrayBuffer)
 
     return hash
-  } catch (e: any){
+  } catch (e: any) {
     console.log("error when downloading", e)
-    throw e;
+    throw e
   }
 }
 
-const fetchDandanplayDanmaku = (obj: Obj) => {
+const fetchDandanplayDanmaku = (obj: Obj, signal?: AbortSignal) => {
   const danmaku: () => Promise<any> = async function () {
-    const fileHash = await fetchFileMd5(objStore.raw_url, objStore.obj.name)
-
-    console.log("filehash", fileHash)
-
-    const data = {
-      fileName: obj.name.replace(/\.[^/.]+$/, ""),
-      fileSize: obj.size,
-      // Dummy hash to pass dandanplay api argument check
-      fileHash,
-      matchMode: "hashAndFileName",
-    }
-    const config = {
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-    }
-
     try {
+      const fileHash = await fetchFileMd5(
+        objStore.raw_url,
+        objStore.obj.name,
+        signal,
+      )
+
+      console.log("filehash", fileHash)
+
+      const data = {
+        fileName: obj.name.replace(/\.[^/.]+$/, ""),
+        fileSize: obj.size,
+        // Dummy hash to pass dandanplay api argument check
+        fileHash,
+        matchMode: "hashAndFileName",
+      }
+      const config = {
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        signal,
+      }
+
       const resp = await axios.post(
         `/danmakuhub/dandanplay/match`,
         data,
         config,
       )
       const d = resp.data
-      const match = d["matches"][0]
+      const match = d["matches"]?.[0]
+      if (!match) {
+        throw new Error("No match found")
+      }
       const match_name = `${match["animeTitle"]} - ${match["episodeTitle"]}`
       const episode_id = match["episodeId"]
 
@@ -124,7 +192,7 @@ const fetchDandanplayDanmaku = (obj: Obj) => {
         `/danmakuhub/dandanplay/comment?episode_id=${episode_id}`,
         config,
       )
-      const comments: Array<any> = danmaku_resp.data["comments"]
+      const comments: Array<any> = danmaku_resp.data["comments"] || []
 
       let cvt_danmaku = comments.map((e) => {
         // <d p="23.826000213623,1,25,16777215,1422201084,0,057075e9,757076900">我从未见过如此厚颜无耻之猴</d>
@@ -161,7 +229,10 @@ const fetchDandanplayDanmaku = (obj: Obj) => {
         ...cvt_danmaku,
       ]
       return cvt_danmaku
-    } catch {
+    } catch (e: any) {
+      if (signal?.aborted) {
+        return []
+      }
       return [
         {
           text: "加载弹幕失败了捏",
@@ -329,8 +400,13 @@ const Preview = () => {
 
   // TODO: add a switch in manage panel to choose whether to enable `libass-wasm`
   const enableEnhanceAss = true
+  let danmakuAbortController: AbortController | undefined
 
   const switchUrl = (url: string) => {
+    danmakuAbortController?.abort()
+    danmakuAbortController = new AbortController()
+    const signal = danmakuAbortController.signal
+
     const { playing } = player
     player.pause()
     player.option.id = pathname()
@@ -442,7 +518,7 @@ const Preview = () => {
     const dandanplayDanmakuEnabled =
       true || getSettingBool("dandanplay_danmaku_enabled")
     const danmukuSource = dandanplayDanmakuEnabled
-      ? fetchDandanplayDanmaku(objStore.obj)
+      ? fetchDandanplayDanmaku(objStore.obj, signal)
       : danmu
         ? proxyLink(danmu, true)
         : undefined
@@ -535,6 +611,7 @@ const Preview = () => {
     })
   })
   onCleanup(() => {
+    danmakuAbortController?.abort()
     setShouldKeepState(false)
     if (player) {
       player.fullscreenWeb = false
